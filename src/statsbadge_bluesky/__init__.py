@@ -6,18 +6,18 @@ that only what anyone could see is here.
 
     com.atproto.identity.resolveHandle    a handle to the DID a feed URI is built from
     app.bsky.actor.getProfile             the counters, and who this is
-    app.bsky.feed.getAuthorFeed           the newest post, and its own numbers
+    app.bsky.feed.getAuthorFeed           the newest post, and its numbers
     app.bsky.feed.getPostThread           the newest reply to it, which is the public
                                           half of a mention: notifications need a login
     app.bsky.feed.getFeed                 the newest post in a feed
     app.bsky.feed.getFeedGenerator        that feed's name and how many like it
 
-Every handle and every feed is a group of its own, so the config UI offers them by name under
-one Bluesky heading and a page can take a message from one and a counter from another.
+Every handle and every feed becomes a separate group, so the config UI offers them by name
+under one Bluesky heading and a page can take a message from one and a counter from another.
 
-The messages travel as the shape a `notify` page draws - who it is from, what it says, how
-long ago, and a word about why - which is the same shape a Mastodon post or an RSS entry has,
-so none of this is Bluesky-specific by the time it reaches the badge.
+The messages travel in the shape a `notify` page draws: who sent it, the words, how long ago,
+and a note about why. A Mastodon post and an RSS entry arrive in the same shape, so nothing is
+Bluesky-specific by the time it reaches the badge.
 """
 
 import base64
@@ -35,8 +35,8 @@ from statsbadge.sources.base import Source
 
 APPVIEW = "https://public.api.bsky.app/xrpc"
 
-# How often the AppView is asked, unless the setting says otherwise. A timeline is not a
-# sensor, and a handful of requests every two minutes is nothing to a public service.
+# How often the AppView is asked, unless the `every` setting overrides it. A timeline is not
+# a sensor, and a handful of requests every two minutes is nothing to a public service.
 DEFAULT_EVERY = 120.0
 MIN_EVERY = 30.0
 MAX_EVERY = 3600.0
@@ -47,18 +47,18 @@ FETCH_POLL = 1.0
 # replied to, on an account that reposts a good deal.
 FEED_SCAN = 25
 
-# How many of those threads to open looking for a reply from somebody else. More than one
-# because a thread whose only reply is the author carrying on their own thought is common,
-# and few because each is a request and there is one of these per handle watched.
+# How many of those threads to open looking for a reply from somebody else. More than one,
+# since the only reply is often the author carrying on their own thought; few, since each
+# costs a request per handle watched.
 REPLY_SCAN = 3
 
 # A post is three hundred characters and the page draws two or three lines of it. Cut here
 # rather than on the badge: the rest is neither drawn nor worth sending every time it changes.
 TEXT_MAX = 160
 
-# The counters, kept once an hour so a graph of them says something. The AppView reports no
-# history of its own, so this is the only place one can come from - which means a ring starts
-# empty and fills as the host runs.
+# The counters, kept once an hour so a graph of them shows a trend. The AppView reports no
+# history, so this is the only place one can come from: a ring starts empty and fills as the
+# host runs.
 HISTORY_EVERY = 3600.0
 HISTORY_POINTS = 48
 HISTORY_MS = int(HISTORY_EVERY * 1000)
@@ -66,20 +66,19 @@ HISTORIED = ("followers", "following", "posts")
 COUNTS = "counts"
 NAMES = "names"
 
-# What this says when it has been given nothing to watch. Not counted as a fault - an
-# extension nobody has configured is not broken - but worth showing, since a silent source
-# that reports nothing looks the same as one that is not installed.
+# Shown when no handles or feeds are configured. Not counted as a fault, but it has to be
+# visible: a source quietly reporting nothing looks the same as one that was never installed.
 UNSET = "no handles or feeds set"
 
-# Which preset a setting asks for. Landscape either way: the page puts a picture down the left
-# of the words, and a tall one beside two lines of text is a column of nothing.
+# The imaging preset each `images` choice maps to. Landscape either way, since a page sets
+# the picture beside two or three lines of text.
 PRESETS = {"small": "low", "large": "high"}
-# How many decoded pictures to remember, keyed by the post they came from: the same few posts
-# are refetched every couple of minutes and nothing about them changed.
+# How many decoded pictures to keep, keyed by the post they came from: the same few posts are
+# refetched every couple of minutes and their images have not changed.
 IMAGE_CACHE = 24
 
 # What a group is called in the frame. A field reference is "group.field" split on its one
-# dot, so neither a handle nor a feed can keep its own punctuation.
+# dot, so neither a handle nor a feed can keep its punctuation.
 ACCOUNT_PREFIX = "bsky_"
 FEED_PREFIX = "bskyfeed_"
 
@@ -133,8 +132,8 @@ class Bluesky(Source):
         self._counts = {}
         self._counts_at = None
         # What each group turned out to be called, and each handle's DID. Both are learned
-        # from a fetch and both outlive it: a feed is offered by its own name rather than by
-        # the slug in its URI, and a DID resolved once is a request not made again.
+        # from a fetch and both outlive it: a feed keeps the display name it answered with,
+        # and a DID resolved once is a request not made again.
         self._names = {}
         self._dids = {}
         self._lock = threading.Lock()
@@ -148,7 +147,7 @@ class Bluesky(Source):
     # -- lifecycle ----------------------------------------------------------
 
     def start(self):
-        """Take up what the last run kept, then fetch on a thread of its own.
+        """Take up what the last run kept, then fetch on a background thread.
 
         Nothing in `sample` may wait on a network: every source shares the collector's
         thread and the first sample is taken while the server is still starting up.
@@ -157,8 +156,8 @@ class Bluesky(Source):
         with self._lock:
             self._counts = {name: list(points) for name, points in kept.items()
                             if isinstance(points, list)}
-            # Names too, so a feed is offered by its own name on the first page load rather
-            # than by the slug out of its URI until a fetch has landed.
+            # Names too, so a feed carries its display name on the first page load, before
+            # any fetch has landed.
             self._names = dict(self.store.get(NAMES) or {})
         self._read_settings()
         if self._fetcher is None:
@@ -175,7 +174,7 @@ class Bluesky(Source):
             self._fetcher = None
 
     def configure(self, settings):
-        """Take settings while running, and ask again rather than waiting out the interval."""
+        """Take settings while running, and ask again without waiting out the interval."""
         super().configure(settings)
         was = {entry["slug"] for entry in self._watched}
         self._read_settings()
@@ -196,9 +195,9 @@ class Bluesky(Source):
     def _read_settings(self):
         """Re-read the settings, and rebuild what is offered from them.
 
-        `groups` is read off the source rather than off the class, so a handle typed into the
-        config UI is a group the page picker offers as soon as it is saved - the readings
-        follow when the first fetch lands.
+        `groups` is read off the source, not the class, so a handle typed into the config UI
+        is a group the page picker offers as soon as it is saved. The readings follow when
+        the first fetch lands.
         """
         try:
             every = float(self.config.get("every") or DEFAULT_EVERY)
@@ -206,8 +205,8 @@ class Bluesky(Source):
             every = DEFAULT_EVERY
         self.every = max(MIN_EVERY, min(MAX_EVERY, every))
         wanted = str(self.config.get("images") or "small")
-        # Off where the extra is not installed, rather than a fault on every fetch: a host
-        # with no decoder should show the words and say nothing about it.
+        # Off where the extra is not installed, rather than a fault on every fetch: on a host
+        # with no decoder the words alone are the message.
         self.preset = PRESETS.get(wanted)
 
         watched = []
@@ -239,8 +238,8 @@ class Bluesky(Source):
         """Remember what a group turned out to be called, and offer it under that.
 
         A feed is configured as a URI and called something else - `mechkeebs` is "Mechanical
-        Keyboards" - and the picker should say the second. Kept, so the name survives a
-        restart and the first page load after one is not a list of slugs.
+        Keyboards" - and the picker should show the second. Kept, so the name survives a
+        restart and is there on the first page load after one.
         """
         if not name:
             return
@@ -255,7 +254,7 @@ class Bluesky(Source):
     # -- sampling -----------------------------------------------------------
 
     def sample(self, frame, dt):
-        """Whatever the fetcher last brought back. Nothing here touches the network."""
+        """Whatever the fetcher last brought back, copied out under the lock."""
         with self._lock:
             readings = {group: dict(values) for group, values in self._readings.items()
                         # A handle taken out of the settings a moment ago is still in the last
@@ -281,7 +280,7 @@ class Bluesky(Source):
                 for ref, points in counts.items() if points}
 
     def note_fault(self, exc):
-        """What the AppView said, without a type name in front of it."""
+        """Record an AppView error as plain text, without a type name in front of it."""
         if isinstance(exc, BlueskyError):
             self.faults += 1
             self.last_fault = str(exc)
@@ -295,8 +294,8 @@ class Bluesky(Source):
             try:
                 self._refresh()
             except Exception as exc:
-                # The fetcher must not die, or the timeline would stand at whatever it last
-                # was with nothing ever replacing it.
+                # The fetcher has to survive a bad fetch, or the timeline would stand at
+                # whatever it last was for as long as the host runs.
                 self.note_fault(exc)
             self._wake.wait(FETCH_POLL)
             self._wake.clear()
@@ -328,8 +327,8 @@ class Bluesky(Source):
             self._keep_counts(readings)
             self.note_ok()
         if trouble is not None:
-            # After note_ok, which is what clears a fault: what did answer stands, and what
-            # somebody typed wrong is still wrong.
+            # After note_ok, which clears a fault: whatever did answer stands, and a handle
+            # typed wrong is still wrong.
             self.note_fault(trouble)
 
     def _fetch_account(self, entry):
@@ -366,9 +365,9 @@ class Bluesky(Source):
     def _newest_reply(self, feed, did):
         """The newest reply somebody else left on one of their recent posts.
 
-        The public AppView has no notifications and refuses post search without a login, so
-        the threads under their own posts are where a mention has to come from. Their own
-        replies do not count: a thread they are carrying on alone is not somebody answering.
+        The public AppView serves no notifications, and post search needs a login, so the
+        threads under their posts are where a mention has to come from. A reply from the
+        account itself is skipped: a thread they are carrying on alone is not an answer.
         """
         answered = [item for item in feed
                     if not item.get("reason") and (item["post"].get("replyCount") or 0)]
@@ -415,11 +414,11 @@ class Bluesky(Source):
         raise BlueskyError(f"cannot tell what feed {spec!r} is")
 
     def _with_picture(self, item, post):
-        """`item` with one picture on it, where the post has one and the setting wants it.
+        """`item` with one picture on it, where the post has one and `images` is on.
 
         One per post: a page has room for one, and the first image is the one the author led
-        with. A picture that will not fetch or will not decode is left off - the words are the
-        post, and a message with no picture is a smaller message rather than a failure worth
+        with. A picture that will not fetch or will not decode is omitted: the words are the
+        post, and a message with no picture is a smaller message, not a failure worth
         reporting.
         """
         if item is None or not self.preset or not post:
@@ -427,8 +426,8 @@ class Bluesky(Source):
         url = _thumbnail(post.get("embed"))
         if not url:
             return item
-        # Keyed on the preset too, so changing the setting is not a page of the old size until
-        # every post happens to change.
+        # Keyed on the preset too, so changing the setting redraws at the new size on the
+        # next fetch.
         key = f"{self.preset}:{url}"
         if key not in self._images:
             made = None
@@ -482,8 +481,8 @@ class Bluesky(Source):
             with urllib.request.urlopen(request, timeout=15) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            # The status alone says nothing useful: a handle that does not exist and a handle
-            # spelled with an @ are both 400, and the body says which.
+            # The status alone is not enough: a handle that does not exist and a handle
+            # prefixed with an @ are both 400. The body is where the difference is.
             detail = ""
             try:
                 said = json.loads(exc.read().decode("utf-8")) or {}
@@ -495,7 +494,7 @@ class Bluesky(Source):
 
 
 class BlueskyError(Exception):
-    """What the AppView said was wrong, as one line for the config UI to show."""
+    """An AppView error, as one line for the config UI to show."""
 
 
 # -- reading the settings ---------------------------------------------------
@@ -511,10 +510,10 @@ def _listed(given, clean):
 
 
 def _handle(given):
-    """A handle as the AppView wants it: no @, no https://, no trailing path.
+    """A handle in the form the AppView accepts: no @, no https://, no trailing path.
 
-    People paste their profile URL and people type the @ they see on the page, and both are
-    a 400 from an endpoint that wanted `gadgetoid.com`.
+    People paste their profile URL, and people type the @ they see on the page. Both are a
+    400 from an endpoint expecting `gadgetoid.com`.
     """
     text = str(given or "").strip().lstrip("@")
     if "/" in text:
@@ -526,7 +525,7 @@ def _handle(given):
 
 
 def _rkey(spec):
-    """What a feed is called in its own URI, which names it until the AppView is asked.
+    """What a feed is called in its URI, which names it until the AppView is asked.
 
     Both ways of writing one end in it: `.../feed/mechkeebs` and
     `at://<did>/app.bsky.feed.generator/mechkeebs`.
@@ -582,7 +581,7 @@ def _flat(text):
 def _words(post):
     """A post as one line. Bluesky sends plain text, so this is mostly flattening it.
 
-    A post can carry no words at all - a link on its own, or a picture on its own - and a
+    A post can carry no words at all - a bare link, or a bare picture - and a
     block with a name and nothing under it reads as a failure. The card's headline and an
     image's alt text are what the post shows in that case.
     """
@@ -602,7 +601,7 @@ def _thumbnail(embed):
 
     A post carries at most one embed and three shapes of it matter: images, a quoted post with
     images beside it, and a link card, whose picture is the one the post actually shows. A
-    video's thumbnail is a still of something moving and says less than the words do.
+    video's thumbnail is a still of something moving and shows less than the words do.
     """
     embed = embed or {}
     kind = embed.get("$type") or ""
@@ -619,9 +618,9 @@ def _thumbnail(embed):
 def _post_item(entry):
     """One feed entry as the four things a notifications page draws.
 
-    A feed hands back a post inside a wrapper that says why it is there, and a reply is handed
-    back bare - so both are taken. A repost has no words of its own, and what is drawn is the
-    post itself with who sent it round as the note.
+    A feed hands back a post inside a wrapper giving the reason it is there, and a reply is
+    handed back bare - so both are taken. A repost has no words of its own, and what is drawn
+    is the post itself with who sent it round as the note.
     """
     post = entry.get("post") or entry
     reason = (entry.get("reason") or {}).get("$type") or ""
