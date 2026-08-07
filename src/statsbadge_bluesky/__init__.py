@@ -58,7 +58,7 @@ TEXT_MAX = 160
 
 # The counters, kept once an hour so a graph of them shows a trend. The AppView reports no
 # history, so this is the only place one can come from: a ring starts empty and fills as the
-# host runs.
+# host runs. 48 points an hour apart is two days, and 48 is what a badge asks for by default.
 HISTORY_EVERY = 3600.0
 HISTORY_POINTS = 48
 HISTORY_MS = int(HISTORY_EVERY * 1000)
@@ -266,8 +266,8 @@ class Bluesky(Source):
     def series(self):
         """The counter rings, on the hour they are kept at.
 
-        The collector would sample these at its own rate, and ninety seconds of a follower
-        count is a flat line. An hour apart is the shape of a week.
+        The collector would sample these at its own rate, and its ninety seconds of a
+        follower count is a flat line. An hour apart, 48 points cover two days.
         """
         with self._lock:
             counts = {name: list(points) for name, points in self._counts.items()

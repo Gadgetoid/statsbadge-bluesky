@@ -60,7 +60,7 @@ A **feed**:
 
 Latest post and Latest reply are messages. They go on a **Notifications** page as a block of text with the sender and how long ago. The rest are numbers and go anywhere a number goes.
 
-Followers, following and posts are kept **hourly**, so a graph of any of them shows a week rather than the last ninety seconds. The AppView reports no history, so that ring is built as the host runs: it is empty on a first launch and fills an hour at a time.
+Followers, following and posts are kept **hourly**, so a graph of any of them covers the last two days rather than the last ninety seconds. The AppView reports no history, so that ring is built as the host runs: it is empty on a first launch and fills an hour at a time.
 
 ## Pictures
 
