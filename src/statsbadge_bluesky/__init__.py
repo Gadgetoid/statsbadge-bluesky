@@ -1,4 +1,4 @@
-"""A Bluesky account, its posts and a feed, for a badge to show on a notifications page.
+"""Bluesky accounts and feeds, for a badge to show on a notifications page.
 
 Everything comes from the public AppView at `https://public.api.bsky.app/xrpc`, which serves
 these unauthenticated. No account, no app password, nothing to keep secret - the cost being
@@ -11,6 +11,9 @@ that only what anyone could see is here.
                                           half of a mention: notifications need a login
     app.bsky.feed.getFeed                 the newest post in a feed
     app.bsky.feed.getFeedGenerator        that feed's name and how many like it
+
+Every handle and every feed is a group of its own, so the config UI offers them by name under
+one Bluesky heading and a page can take a message from one and a counter from another.
 
 The messages travel as the shape a `notify` page draws - who it is from, what it says, how
 long ago, and a word about why - which is the same shape a Mastodon post or an RSS entry has,
@@ -33,20 +36,20 @@ from statsbadge.sources.base import Source
 APPVIEW = "https://public.api.bsky.app/xrpc"
 
 # How often the AppView is asked, unless the setting says otherwise. A timeline is not a
-# sensor, and three to five requests every two minutes is nothing to a public service.
+# sensor, and a handful of requests every two minutes is nothing to a public service.
 DEFAULT_EVERY = 120.0
 MIN_EVERY = 30.0
 MAX_EVERY = 3600.0
 RETRY_AFTER = 60.0
 FETCH_POLL = 1.0
 
-# How far back to read the author's feed. Enough to find one post of theirs that somebody has
+# How far back to read an author's feed. Enough to find one post of theirs that somebody has
 # replied to, on an account that reposts a good deal.
 FEED_SCAN = 25
 
 # How many of those threads to open looking for a reply from somebody else. More than one
 # because a thread whose only reply is the author carrying on their own thought is common,
-# and few because each is a request.
+# and few because each is a request and there is one of these per handle watched.
 REPLY_SCAN = 3
 
 # A post is three hundred characters and the page draws two or three lines of it. Cut here
@@ -59,35 +62,42 @@ TEXT_MAX = 160
 HISTORY_EVERY = 3600.0
 HISTORY_POINTS = 48
 HISTORY_MS = int(HISTORY_EVERY * 1000)
+HISTORIED = ("followers", "following", "posts")
 COUNTS = "counts"
-WHO = "who"
+NAMES = "names"
 
-# What this says when it has not been given an account. Not counted as a fault - an extension
-# nobody has configured is not broken - but worth showing, since a silent source that reports
-# nothing looks the same as one that is not installed.
-UNSET = "no handle set"
+# What this says when it has been given nothing to watch. Not counted as a fault - an
+# extension nobody has configured is not broken - but worth showing, since a silent source
+# that reports nothing looks the same as one that is not installed.
+UNSET = "no handles or feeds set"
 
 # Which preset a setting asks for. Landscape either way: the page puts a picture down the left
 # of the words, and a tall one beside two lines of text is a column of nothing.
 PRESETS = {"small": "low", "large": "high"}
 # How many decoded pictures to remember, keyed by the post they came from: the same few posts
 # are refetched every couple of minutes and nothing about them changed.
-IMAGE_CACHE = 12
+IMAGE_CACHE = 24
 
-GROUP = "bluesky"
+# What a group is called in the frame. A field reference is "group.field" split on its one
+# dot, so neither a handle nor a feed can keep its own punctuation.
+ACCOUNT_PREFIX = "bsky_"
+FEED_PREFIX = "bskyfeed_"
 
 FIELDS = {
     "latest": {"label": "Latest post", "item": True},
-    "reply": {"label": "Latest reply to you", "item": True},
-    "feed": {"label": "Latest in the feed", "item": True},
+    "reply": {"label": "Latest reply", "item": True},
     "followers": {"label": "Followers", "history": True},
     "following": {"label": "Following", "history": True},
     "posts": {"label": "Posts", "history": True},
-    "likes": {"label": "Likes on your latest"},
-    "reposts": {"label": "Reposts of your latest"},
-    "replies": {"label": "Replies to your latest"},
-    "quotes": {"label": "Quotes of your latest"},
-    "feed_likes": {"label": "Likes on the feed"},
+    "likes": {"label": "Likes on the latest"},
+    "reposts": {"label": "Reposts of the latest"},
+    "replies": {"label": "Replies to the latest"},
+    "quotes": {"label": "Quotes of the latest"},
+}
+
+FEED_FIELDS = {
+    "latest": {"label": "Latest post", "item": True},
+    "likes": {"label": "Likes on the feed"},
 }
 
 
@@ -96,11 +106,12 @@ class Bluesky(Source):
     label = "Bluesky"
 
     settings = (
-        {"key": "handle", "label": "Handle", "type": "text",
-         "hint": "The account to watch, like gadgetoid.com or someone.bsky.social - no @"},
-        {"key": "feed", "label": "Feed", "type": "text",
-         "hint": "Optional. A feed's page on bsky.app, or the at:// URI it is published "
-                 "under. Leave it empty for no feed"},
+        {"key": "handles", "label": "Handles", "type": "text",
+         "hint": "Accounts to watch, separated by commas: gadgetoid.com, "
+                 "someone.bsky.social. The @, and a profile URL pasted whole, both work"},
+        {"key": "feeds", "label": "Feeds", "type": "text",
+         "hint": "Feeds to watch, separated by commas. A feed's page on bsky.app, or the "
+                 "at:// URI it is published under"},
         {"key": "every", "label": "Ask every", "type": "number",
          "default": int(DEFAULT_EVERY), "unit": "seconds",
          "min": int(MIN_EVERY), "max": int(MAX_EVERY), "step": 30},
@@ -121,12 +132,14 @@ class Bluesky(Source):
         self._images = {}
         self._counts = {}
         self._counts_at = None
+        # What each group turned out to be called, and each handle's DID. Both are learned
+        # from a fetch and both outlive it: a feed is offered by its own name rather than by
+        # the slug in its URI, and a DID resolved once is a request not made again.
+        self._names = {}
+        self._dids = {}
         self._lock = threading.Lock()
         self._next = 0.0
         self._next_history = 0.0
-        # Trouble with the configured feed, which is reported without the account's own
-        # readings being lost to it.
-        self._feed_fault = None
         self._fetcher = None
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -135,7 +148,7 @@ class Bluesky(Source):
     # -- lifecycle ----------------------------------------------------------
 
     def start(self):
-        """Take up the rings the last run kept, then fetch on a thread of its own.
+        """Take up what the last run kept, then fetch on a thread of its own.
 
         Nothing in `sample` may wait on a network: every source shares the collector's
         thread and the first sample is taken while the server is still starting up.
@@ -144,6 +157,10 @@ class Bluesky(Source):
         with self._lock:
             self._counts = {name: list(points) for name, points in kept.items()
                             if isinstance(points, list)}
+            # Names too, so a feed is offered by its own name on the first page load rather
+            # than by the slug out of its URI until a fetch has landed.
+            self._names = dict(self.store.get(NAMES) or {})
+        self._read_settings()
         if self._fetcher is None:
             self._stop.clear()
             self._fetcher = threading.Thread(target=self._fetch_loop, daemon=True,
@@ -160,24 +177,29 @@ class Bluesky(Source):
     def configure(self, settings):
         """Take settings while running, and ask again rather than waiting out the interval."""
         super().configure(settings)
-        was = self.handle
+        was = {entry["slug"] for entry in self._watched}
         self._read_settings()
-        if self.last_fault == UNSET and self.handle:
+        if self.last_fault == UNSET and self._watched:
             # That message was about the settings, and they have just been given. Waiting for
-            # a fetch to succeed before withdrawing it leaves the config page saying no handle
+            # a fetch to succeed before withdrawing it leaves the config page saying nothing
             # is set for as long as the first few requests take.
             self.last_fault = None
-        if was != self.handle:
-            # A different account's readings are not this one's, and neither are its pictures.
+        if was != {entry["slug"] for entry in self._watched}:
             with self._lock:
-                self._readings = {}
-            self._images = {}
+                self._readings = {group: values for group, values in self._readings.items()
+                                  if group in self.groups}
         self._next = 0.0
         self._wake.set()
 
+    # -- what this source offers --------------------------------------------
+
     def _read_settings(self):
-        self.handle = _handle(self.config.get("handle"))
-        self.feed = str(self.config.get("feed") or "").strip()
+        """Re-read the settings, and rebuild what is offered from them.
+
+        `groups` is read off the source rather than off the class, so a handle typed into the
+        config UI is a group the page picker offers as soon as it is saved - the readings
+        follow when the first fetch lands.
+        """
         try:
             every = float(self.config.get("every") or DEFAULT_EVERY)
         except (TypeError, ValueError):
@@ -187,19 +209,60 @@ class Bluesky(Source):
         # Off where the extra is not installed, rather than a fault on every fetch: a host
         # with no decoder should show the words and say nothing about it.
         self.preset = PRESETS.get(wanted)
-        # One group, and slow: a timeline fetched every two minutes has no business in a frame
-        # the badge collects every second.
-        self.groups = {GROUP: {"label": "Bluesky", "slow": True, "fields": dict(FIELDS)}}
-        self.provides = (GROUP,)
+
+        watched = []
+        taken = set()
+        for handle in _listed(self.config.get("handles"), _handle):
+            slug = _unique(ACCOUNT_PREFIX + _slug(handle), taken)
+            watched.append({"slug": slug, "kind": "account", "spec": handle,
+                            "label": handle})
+        for feed in _listed(self.config.get("feeds"), str.strip):
+            slug = _unique(FEED_PREFIX + _slug(_rkey(feed)), taken)
+            watched.append({"slug": slug, "kind": "feed", "spec": feed,
+                            "label": _rkey(feed)})
+        with self._lock:
+            names = dict(self._names)
+        self._watched = watched
+        # Slow, every one of them: a timeline is fetched every couple of minutes and the badge
+        # polls every second, so they travel when they change and not a hundred times over.
+        self.groups = {
+            entry["slug"]: {
+                "label": names.get(entry["slug"]) or entry["label"],
+                "slow": True,
+                "fields": dict(FIELDS if entry["kind"] == "account" else FEED_FIELDS),
+            }
+            for entry in watched
+        }
+        self.provides = tuple(self.groups)
+
+    def _learn_name(self, slug, name):
+        """Remember what a group turned out to be called, and offer it under that.
+
+        A feed is configured as a URI and called something else - `mechkeebs` is "Mechanical
+        Keyboards" - and the picker should say the second. Kept, so the name survives a
+        restart and the first page load after one is not a list of slugs.
+        """
+        if not name:
+            return
+        with self._lock:
+            if self._names.get(slug) == name:
+                return
+            self._names[slug] = name
+            kept = dict(self._names)
+        self.store.set(NAMES, kept)
+        self._read_settings()
 
     # -- sampling -----------------------------------------------------------
 
     def sample(self, frame, dt):
         """Whatever the fetcher last brought back. Nothing here touches the network."""
         with self._lock:
-            readings = dict(self._readings)
-        if readings:
-            frame[GROUP] = readings
+            readings = {group: dict(values) for group, values in self._readings.items()
+                        # A handle taken out of the settings a moment ago is still in the last
+                        # answer, and a group nothing declares is a group nothing can draw.
+                        if group in self.groups}
+        for group, values in readings.items():
+            frame[group] = values
 
     def series(self):
         """The counter rings, on the hour they are kept at.
@@ -208,14 +271,14 @@ class Bluesky(Source):
         count is a flat line. An hour apart is the shape of a week.
         """
         with self._lock:
-            counts = {name: list(points) for name, points in self._counts.items()}
+            counts = {name: list(points) for name, points in self._counts.items()
+                      if name.split(".")[0] in self.groups}
             at = self._counts_at
         if not counts or at is None:
             return {}
         age_ms = max(0, int((time.monotonic() - at) * 1000))
-        return {f"{GROUP}.{name}": {"points": points, "every_ms": HISTORY_MS,
-                                    "age_ms": age_ms}
-                for name, points in counts.items() if points}
+        return {ref: {"points": points, "every_ms": HISTORY_MS, "age_ms": age_ms}
+                for ref, points in counts.items() if points}
 
     def note_fault(self, exc):
         """What the AppView said, without a type name in front of it."""
@@ -239,46 +302,52 @@ class Bluesky(Source):
             self._wake.clear()
 
     def _refresh(self):
-        if not self.handle:
+        if not self._watched:
             # Not a fault: an extension nobody has given an account to is unconfigured, and
             # counting that would report a broken source on every host that installed it.
             self.last_fault = UNSET
             return
         if time.monotonic() < self._next:
             return
-        self._feed_fault = None
-        try:
-            readings = self._fetch()
-        except Exception as exc:
-            self._next = time.monotonic() + RETRY_AFTER
-            self.note_fault(exc)
-            return
-        with self._lock:
-            self._readings = readings
-        self._keep_counts(readings)
-        self._next = time.monotonic() + self.every
-        self.note_ok()
-        if self._feed_fault is not None:
-            # After note_ok, which is what clears a fault: the account's readings stand and
-            # the feed somebody typed in is still wrong.
-            self.note_fault(self._feed_fault)
+        readings = {}
+        trouble = None
+        for entry in list(self._watched):
+            try:
+                if entry["kind"] == "account":
+                    readings[entry["slug"]] = self._fetch_account(entry)
+                else:
+                    readings[entry["slug"]] = self._fetch_feed(entry)
+            except Exception as exc:
+                # One handle spelled wrong must not cost the others their readings, so what
+                # went wrong is carried and reported once everything else has been tried.
+                trouble = exc
+        self._next = time.monotonic() + (self.every if readings else RETRY_AFTER)
+        if readings:
+            with self._lock:
+                self._readings.update(readings)
+            self._keep_counts(readings)
+            self.note_ok()
+        if trouble is not None:
+            # After note_ok, which is what clears a fault: what did answer stands, and what
+            # somebody typed wrong is still wrong.
+            self.note_fault(trouble)
 
-    def _fetch(self):
-        profile = self._get("app.bsky.actor.getProfile", actor=self.handle)
+    def _fetch_account(self, entry):
+        handle = entry["spec"]
+        profile = self._get("app.bsky.actor.getProfile", actor=handle)
         readings = {
             "followers": profile.get("followersCount"),
             "following": profile.get("followsCount"),
             "posts": profile.get("postsCount"),
         }
         did = profile.get("did")
-        self.store.set(WHO, {"did": did,
-                             "name": profile.get("displayName") or profile.get("handle")})
+        self._dids[handle] = did
 
-        feed = self._get("app.bsky.feed.getAuthorFeed", actor=self.handle,
+        feed = self._get("app.bsky.feed.getAuthorFeed", actor=handle,
                          limit=FEED_SCAN, filter="posts_no_replies").get("feed") or ()
         # Their own newest, reposts excluded: a repost carries somebody else's numbers, and
-        # "likes on your latest" would be a stranger's.
-        mine = next((entry for entry in feed if not entry.get("reason")), None)
+        # "likes on the latest" would be a stranger's.
+        mine = next((item for item in feed if not item.get("reason")), None)
         if mine:
             post = mine["post"]
             readings["latest"] = self._with_picture(_post_item(mine), post)
@@ -292,9 +361,6 @@ class Bluesky(Source):
                 # Every one of these is a reply, so saying so beside the name adds nothing.
                 item["note"] = None
                 readings["reply"] = self._with_picture(item, reply.get("post"))
-
-        if self.feed:
-            readings.update(self._fetch_feed(did))
         return readings
 
     def _newest_reply(self, feed, did):
@@ -304,11 +370,11 @@ class Bluesky(Source):
         the threads under their own posts are where a mention has to come from. Their own
         replies do not count: a thread they are carrying on alone is not somebody answering.
         """
-        answered = [entry for entry in feed
-                    if not entry.get("reason") and (entry["post"].get("replyCount") or 0)]
-        for entry in answered[:REPLY_SCAN]:
+        answered = [item for item in feed
+                    if not item.get("reason") and (item["post"].get("replyCount") or 0)]
+        for item in answered[:REPLY_SCAN]:
             thread = self._get("app.bsky.feed.getPostThread",
-                               uri=entry["post"]["uri"], depth=1).get("thread") or {}
+                               uri=item["post"]["uri"], depth=1).get("thread") or {}
             replies = [reply for reply in (thread.get("replies") or ())
                        if reply.get("post")
                        and reply["post"].get("author", {}).get("did") != did]
@@ -316,46 +382,37 @@ class Bluesky(Source):
                 return max(replies, key=lambda reply: _at(reply["post"]) or "")
         return None
 
-    def _fetch_feed(self, owner):
-        """The newest post in the configured feed, and how many people like the feed itself.
-
-        A feed that cannot be read is worth reporting - somebody typed it in - but not worth
-        losing the account's own readings over, so it is caught here and reported after them.
-        """
-        try:
-            uri = self._feed_uri(owner)
-            posts = self._get("app.bsky.feed.getFeed", feed=uri, limit=1).get("feed") or ()
-            about = self._get("app.bsky.feed.getFeedGenerator", feed=uri).get("view") or {}
-        except Exception as exc:
-            self._feed_fault = exc
-            return {}
-        found = {"feed_likes": about.get("likeCount")}
+    def _fetch_feed(self, entry):
+        uri = self._feed_uri(entry["spec"])
+        posts = self._get("app.bsky.feed.getFeed", feed=uri, limit=1).get("feed") or ()
+        about = self._get("app.bsky.feed.getFeedGenerator", feed=uri).get("view") or {}
+        self._learn_name(entry["slug"], about.get("displayName"))
+        readings = {"likes": about.get("likeCount")}
         if posts:
-            # Named after the feed rather than after whoever posted: on a page beside your own
-            # timeline, which feed it came out of is the thing that is not obvious.
-            item = _post_item(posts[0])
-            item["note"] = about.get("displayName") or "feed"
-            found["feed"] = self._with_picture(item, posts[0].get("post"))
-        return found
+            readings["latest"] = self._with_picture(_post_item(posts[0]),
+                                                    posts[0].get("post"))
+        return readings
 
-    def _feed_uri(self, owner):
-        """The at:// URI of the configured feed, from either way of writing one.
+    def _feed_uri(self, spec):
+        """The at:// URI of a configured feed, from either way of writing one.
 
         A feed is shared as its page on bsky.app - `/profile/<handle>/feed/<name>` - and
         published as `at://<did>/app.bsky.feed.generator/<name>`. Pasting the first is what
         anybody will do, and the handle in it has to be resolved: an at:// URI names a DID.
         """
-        if self.feed.startswith("at://"):
-            return self.feed
-        parts = urllib.parse.urlsplit(self.feed if "//" in self.feed else f"//{self.feed}")
+        if spec.startswith("at://"):
+            return spec
+        parts = urllib.parse.urlsplit(spec if "//" in spec else f"//{spec}")
         crumbs = [crumb for crumb in parts.path.split("/") if crumb]
         if len(crumbs) >= 4 and crumbs[0] == "profile" and crumbs[2] == "feed":
-            who, name = crumbs[1], crumbs[3]
-            did = (owner if who == self.handle
-                   else self._get("com.atproto.identity.resolveHandle",
-                                  handle=who).get("did"))
+            who, name = _handle(crumbs[1]), crumbs[3]
+            did = self._dids.get(who)
+            if not did:
+                did = self._get("com.atproto.identity.resolveHandle",
+                                handle=who).get("did")
+                self._dids[who] = did
             return f"at://{did}/app.bsky.feed.generator/{name}"
-        raise BlueskyError(f"cannot tell what feed {self.feed!r} is")
+        raise BlueskyError(f"cannot tell what feed {spec!r} is")
 
     def _with_picture(self, item, post):
         """`item` with one picture on it, where the post has one and the setting wants it.
@@ -402,15 +459,16 @@ class Bluesky(Source):
             return
         self._next_history = now + HISTORY_EVERY
         with self._lock:
-            for name in ("followers", "following", "posts"):
-                value = readings.get(name)
-                if value is None:
-                    continue
-                ring = self._counts.setdefault(name, [])
-                ring.append(int(value))
-                del ring[0:max(0, len(ring) - HISTORY_POINTS)]
+            for group, values in readings.items():
+                for name in HISTORIED:
+                    value = values.get(name)
+                    if value is None:
+                        continue
+                    ring = self._counts.setdefault(f"{group}.{name}", [])
+                    ring.append(int(value))
+                    del ring[0:max(0, len(ring) - HISTORY_POINTS)]
             self._counts_at = now
-            kept = {name: list(points) for name, points in self._counts.items()}
+            kept = {ref: list(points) for ref, points in self._counts.items()}
         self.store.set(COUNTS, kept)
 
     # -- talking to it ------------------------------------------------------
@@ -440,7 +498,17 @@ class BlueskyError(Exception):
     """What the AppView said was wrong, as one line for the config UI to show."""
 
 
-# -- turning a post into a message ------------------------------------------
+# -- reading the settings ---------------------------------------------------
+
+def _listed(given, clean):
+    """A comma or newline separated setting as a list, in order, without repeats."""
+    out = []
+    for part in re.split(r"[,\n]", str(given or "")):
+        entry = clean(part)
+        if entry and entry not in out:
+            out.append(entry)
+    return out
+
 
 def _handle(given):
     """A handle as the AppView wants it: no @, no https://, no trailing path.
@@ -456,6 +524,37 @@ def _handle(given):
         text = crumbs[crumbs.index("profile") + 1] if "profile" in crumbs[:-1] else crumbs[-1]
     return text.strip().lower()
 
+
+def _rkey(spec):
+    """What a feed is called in its own URI, which names it until the AppView is asked.
+
+    Both ways of writing one end in it: `.../feed/mechkeebs` and
+    `at://<did>/app.bsky.feed.generator/mechkeebs`.
+    """
+    crumbs = [crumb for crumb in str(spec or "").split("/") if crumb]
+    return crumbs[-1] if crumbs else "feed"
+
+
+def _slug(name):
+    """A handle or a feed as a group name: "pinout.xyz" is `bsky_pinout_xyz`."""
+    return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_") or "one"
+
+
+def _unique(slug, taken):
+    """`slug`, numbered if something else already has it.
+
+    Two feeds can be called the same thing by two people, and a group is one set of readings:
+    the second would otherwise overwrite the first and only one of them would be offered.
+    """
+    candidate, count = slug, 1
+    while candidate in taken:
+        count += 1
+        candidate = f"{slug}_{count}"
+    taken.add(candidate)
+    return candidate
+
+
+# -- turning a post into a message ------------------------------------------
 
 def _at(post):
     return ((post or {}).get("record") or {}).get("createdAt")
@@ -473,7 +572,7 @@ def _age(stamp):
 
 
 def _who(author):
-    return ((author or {}).get("displayName") or (author or {}).get("handle") or "someone")
+    return (author or {}).get("displayName") or (author or {}).get("handle") or "someone"
 
 
 def _flat(text):
@@ -501,7 +600,7 @@ def _words(post):
 def _thumbnail(embed):
     """The URL of the one picture worth showing for a post, or None.
 
-    A post carries at most one embed and four shapes of it matter: images, a quoted post with
+    A post carries at most one embed and three shapes of it matter: images, a quoted post with
     images beside it, and a link card, whose picture is the one the post actually shows. A
     video's thumbnail is a still of something moving and says less than the words do.
     """
