@@ -1,13 +1,13 @@
 name: Publish
 
 # Publishes statsbadge-bluesky to PyPI on a published release, using trusted publishing:
-# PyPI trusts this workflow via OIDC, so there is no long-lived API token to store or leak.
-# Configure it once at pypi.org/manage/project/statsbadge-bluesky/settings/publishing/
-# with this repository, this workflow filename, and the `pypi` environment.
+# PyPI trusts this workflow via OIDC, so there is no API token to store. Configure it once at
+# pypi.org/manage/project/statsbadge-bluesky/settings/publishing/ with this repository, this
+# workflow filename, and the `pypi` environment.
 #
-# One package in this repository, so the tags are plain vN.N.N and there is no prefix to
-# match on - the extensions vendored in pimoroni/statsbadge each carry one because four
-# packages share that repository and every release fires every workflow.
+# One package in this repository, so the tags are plain vN.N.N. The extensions vendored in
+# pimoroni/statsbadge carry a prefix, since four packages share that repository and every
+# release fires every workflow.
 on:
   release:
     types: [published]
@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # The tag is the version, so the build has to be able to see it. A checkout of a tag
-          # has it at HEAD either way; this keeps a run from a branch honest too.
+          # has it at HEAD either way; this also gives a run from a branch the nearest tag.
           fetch-depth: 0
 
       # setup-uv publishes no v9 tag, only exact versions

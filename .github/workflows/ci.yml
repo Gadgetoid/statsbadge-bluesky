@@ -35,8 +35,8 @@ jobs:
 
       - run: uv build
 
-      # The entry point is the whole mechanism: a typo in it is a package that installs and
-      # provides nothing, and nothing says so.
+      # The entry point is the whole mechanism: a typo in it installs a package that silently
+      # provides nothing.
       - name: Check the entry point is registered
         run: |
           uv venv /tmp/check
