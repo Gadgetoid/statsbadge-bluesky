@@ -22,16 +22,14 @@ Bluesky-specific by the time it reaches the badge.
 
 import base64
 import datetime
-import json
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from statsbadge import imaging
-from statsbadge.sources.base import Source
+from statsbadge.sources import web
+from statsbadge.sources.base import PollingSource, SourceError
 
 APPVIEW = "https://public.api.bsky.app/xrpc"
 
@@ -41,7 +39,6 @@ DEFAULT_EVERY = 120.0
 MIN_EVERY = 30.0
 MAX_EVERY = 3600.0
 RETRY_AFTER = 60.0
-FETCH_POLL = 1.0
 
 # How far back to read an author's feed. Enough to find one post of theirs that somebody has
 # replied to, on an account that reposts a good deal.
@@ -100,7 +97,7 @@ FEED_FIELDS = {
 }
 
 
-class Bluesky(Source):
+class Bluesky(PollingSource):
     name = "bluesky"
     label = "Bluesky"
 
@@ -139,9 +136,6 @@ class Bluesky(Source):
         self._lock = threading.Lock()
         self._next = 0.0
         self._next_history = 0.0
-        self._fetcher = None
-        self._wake = threading.Event()
-        self._stop = threading.Event()
         self._read_settings()
 
     # -- lifecycle ----------------------------------------------------------
@@ -160,35 +154,21 @@ class Bluesky(Source):
             # any fetch has landed.
             self._names = dict(self.store.get(NAMES) or {})
         self._read_settings()
-        if self._fetcher is None:
-            self._stop.clear()
-            self._fetcher = threading.Thread(target=self._fetch_loop, daemon=True,
-                                             name="statsbadge-bluesky")
-            self._fetcher.start()
-
-    def stop(self):
-        self._stop.set()
-        self._wake.set()
-        if self._fetcher is not None:
-            self._fetcher.join(timeout=2.0)
-            self._fetcher = None
+        super().start()
 
     def configure(self, settings):
         """Take settings while running, and ask again without waiting out the interval."""
         super().configure(settings)
         was = {entry["slug"] for entry in self._watched}
         self._read_settings()
-        if self.last_fault == UNSET and self._watched:
-            # That message was about the settings, and they have just been given. Waiting for
-            # a fetch to succeed before withdrawing it leaves the config page saying nothing
-            # is set for as long as the first few requests take.
-            self.last_fault = None
+        if self._watched:
+            self.note_ok("setup")
         if was != {entry["slug"] for entry in self._watched}:
             with self._lock:
                 self._readings = {group: values for group, values in self._readings.items()
                                   if group in self.groups}
         self._next = 0.0
-        self._wake.set()
+        self.wake()
 
     # -- what this source offers --------------------------------------------
 
@@ -199,15 +179,8 @@ class Bluesky(Source):
         is a group the page picker offers as soon as it is saved. The readings follow when
         the first fetch lands.
         """
-        try:
-            every = float(self.config.get("every") or DEFAULT_EVERY)
-        except (TypeError, ValueError):
-            every = DEFAULT_EVERY
-        self.every = max(MIN_EVERY, min(MAX_EVERY, every))
-        wanted = str(self.config.get("images") or "small")
-        # Off where the extra is not installed, rather than a fault on every fetch: on a host
-        # with no decoder the words alone are the message.
-        self.preset = PRESETS.get(wanted)
+        self.every = float(self.config["every"])
+        self.preset = PRESETS.get(self.config["images"])
 
         watched = []
         taken = set()
@@ -279,57 +252,32 @@ class Bluesky(Source):
         return {ref: {"points": points, "every_ms": HISTORY_MS, "age_ms": age_ms}
                 for ref, points in counts.items() if points}
 
-    def note_fault(self, exc):
-        """Record an AppView error as plain text, without a type name in front of it."""
-        if isinstance(exc, BlueskyError):
-            self.faults += 1
-            self.last_fault = str(exc)
-            return
-        super().note_fault(exc)
-
     # -- fetching -----------------------------------------------------------
 
-    def _fetch_loop(self):
-        while not self._stop.is_set():
-            try:
-                self._refresh()
-            except Exception as exc:
-                # The fetcher has to survive a bad fetch, or the timeline would stand at
-                # whatever it last was for as long as the host runs.
-                self.note_fault(exc)
-            self._wake.wait(FETCH_POLL)
-            self._wake.clear()
-
-    def _refresh(self):
+    def poll(self):
         if not self._watched:
             # Not a fault: an extension nobody has given an account to is unconfigured, and
             # counting that would report a broken source on every host that installed it.
-            self.last_fault = UNSET
+            self.note_waiting(UNSET, key="setup")
             return
         if time.monotonic() < self._next:
             return
         readings = {}
-        trouble = None
         for entry in list(self._watched):
             try:
                 if entry["kind"] == "account":
                     readings[entry["slug"]] = self._fetch_account(entry)
                 else:
                     readings[entry["slug"]] = self._fetch_feed(entry)
-            except Exception as exc:
-                # One handle spelled wrong must not cost the others their readings, so what
-                # went wrong is carried and reported once everything else has been tried.
-                trouble = exc
+                self.note_ok(entry["slug"])
+            except Exception as exc:  # noqa: BLE001
+                # One handle spelled wrong must not cost the others their readings.
+                self.note_fault(exc, key=entry["slug"])
         self._next = time.monotonic() + (self.every if readings else RETRY_AFTER)
         if readings:
             with self._lock:
                 self._readings.update(readings)
             self._keep_counts(readings)
-            self.note_ok()
-        if trouble is not None:
-            # After note_ok, which clears a fault: whatever did answer stands, and a handle
-            # typed wrong is still wrong.
-            self.note_fault(trouble)
 
     def _fetch_account(self, entry):
         handle = entry["spec"]
@@ -432,10 +380,8 @@ class Bluesky(Source):
         if key not in self._images:
             made = None
             try:
-                with urllib.request.urlopen(url, timeout=15) as response:
-                    raw = response.read()
-                made = base64.b64encode(
-                    imaging.thumbnail(raw, self.preset, "landscape")).decode("ascii")
+                made = base64.b64encode(imaging.thumbnail(
+                    web.fetch_bytes(url), self.preset, "landscape")).decode("ascii")
             except Exception:
                 made = None
             if len(self._images) >= IMAGE_CACHE:
@@ -475,25 +421,12 @@ class Bluesky(Source):
     def _get(self, method, **params):
         query = urllib.parse.urlencode({key: value for key, value in params.items()
                                         if value is not None})
-        request = urllib.request.Request(f"{APPVIEW}/{method}?{query}",
-                                         headers={"Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            # The status alone is not enough: a handle that does not exist and a handle
-            # prefixed with an @ are both 400. The body is where the difference is.
-            detail = ""
-            try:
-                said = json.loads(exc.read().decode("utf-8")) or {}
-                detail = said.get("message") or said.get("error") or ""
-            except Exception:
-                detail = ""
-            raise BlueskyError(f"HTTP {exc.code}"
-                               + (f": {detail}" if detail else "")) from exc
+        # The status alone is not enough: a handle that does not exist and a handle
+        # prefixed with an @ are both 400, and the body is where the difference is.
+        return web.fetch_json(f"{APPVIEW}/{method}?{query}")
 
 
-class BlueskyError(Exception):
+class BlueskyError(SourceError):
     """An AppView error, as one line for the config UI to show."""
 
 
